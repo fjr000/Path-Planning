@@ -1,0 +1,8 @@
+{
+  "query_host": "192.168.3.12",
+  "query_port": 5555,
+  "query_request": "free/tinder/v3/box2/query",
+  "server_host": "0.0.0.0",
+  "server_port": 8025,
+  "tile_url": "http://192.168.3.100:8035/map/image/tiles/{z}/{x}/{-y}.jpg"
+}

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>路径规划测试</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+        }
+
+        #app {
+            display: flex;
+            height: 100%;
+        }
+
+        #sidebar {
+            width: 320px;
+            padding: 12px;
+            border-right: 1px solid #eee;
+            box-sizing: border-box;
+        }
+
+        #map {
+            flex: 1;
+        }
+
+        .row {
+            margin-bottom: 10px;
+        }
+
+        label {
+            display: inline-block;
+            width: 80px;
+        }
+
+        input[type="number"] {
+            width: 200px;
+        }
+
+        .coord {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            color: #555;
+        }
+
+        .help {
+            color: #666;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        button {
+            padding: 6px 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <div id="sidebar">
+            <h3>路径规划测试</h3>
+            <div class="row">
+                <label>服务地址</label>
+                <input id="apiBase" type="text" value="" />
+            </div>
+            <div class="row">
+                <label>alt</label>
+                <input id="alt" type="number" step="1" value="0.0" />
+            </div>
+            <div class="row">
+                <div class="help">在地图上点击两次：第一次为起点，第二次为终点。再次点击将重置。</div>
+            </div>
+            <div class="row">
+                <div><b>起点</b> <span id="ori" class="coord">-</span></div>
+                <div class="help">query_alt: <span id="oriAlt">-</span></div>
+                <div style="height:6px"></div>
+                <div><b>终点</b> <span id="ter" class="coord">-</span></div>
+                <div class="help">query_alt: <span id="terAlt">-</span></div>
+            </div>
+            <div class="row">
+                <button id="planBtn">执行规划</button>
+                <button id="resetBtn" style="margin-left:8px;">重置</button>
+            </div>
+            <div class="row">
+                <div id="msg" class="help"></div>
+            </div>
+            <div class="row">
+                <div class="help">轨迹输出</div>
+                <pre id="traj"
+                    style="max-height:140px;overflow:auto;background:#f8f9fa;padding:8px;border:1px solid #eee;"></pre>
+            </div>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+        // 初始化地图（从后端 /web-config 读取 tile_url）
+        const map = L.map('map').setView([25.20, 121.50], 11);
+        (async () => {
+            try {
+                const base = (document.getElementById('apiBase').value || window.location.origin).replace(/\/$/, '');
+                const resp = await fetch(`${base}/web-config`);
+                const cfg = await resp.json();
+                const tileUrl = (cfg && cfg.tile_url) ? cfg.tile_url : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+                L.tileLayer(tileUrl, {
+                    maxZoom: 19,
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/">OSM</a> contributors'
+                }).addTo(map);
+            } catch (e) {
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+            }
+        })();
+
+        // 状态
+        let startMarker = null;
+        let endMarker = null;
+        let polyline = null;
+        let clicks = 0;
+
+        const elOri = document.getElementById('ori');
+        const elTer = document.getElementById('ter');
+        const elAlt = document.getElementById('alt');
+        const elMsg = document.getElementById('msg');
+        const elApi = document.getElementById('apiBase');
+        const elOriAlt = document.getElementById('oriAlt');
+        const elTerAlt = document.getElementById('terAlt');
+
+        function fmtCoord(latlng) {
+            return `${latlng.lat.toFixed(6)}, ${latlng.lng.toFixed(6)}`;
+        }
+
+        function setMessage(text, isError = false) {
+            elMsg.style.color = isError ? '#b00020' : '#666';
+            elMsg.textContent = text || '';
+        }
+
+        function clearMap() {
+            if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
+            if (endMarker) { map.removeLayer(endMarker); endMarker = null; }
+            if (polyline) { map.removeLayer(polyline); polyline = null; }
+            clicks = 0;
+            elOri.textContent = '-';
+            elTer.textContent = '-';
+            elOriAlt.textContent = '-';
+            elTerAlt.textContent = '-';
+        }
+
+        async function fetchQueryAlt(latlng) {
+            try {
+                const base = elApi.value.replace(/\/$/, '');
+                const url = `${base}/query-alt?lon=${latlng.lng}&lat=${latlng.lat}`;
+                const resp = await fetch(url);
+                const data = await resp.json();
+                if (data && data.status === 'success') return data.query_alt;
+                return undefined;
+            } catch (_) {
+                return undefined;
+            }
+        }
+
+        map.on('click', (e) => {
+            if (clicks === 0) {
+                clearMap();
+                startMarker = L.marker(e.latlng, { draggable: true }).addTo(map).bindTooltip('起点').openTooltip();
+                elOri.textContent = fmtCoord(e.latlng);
+                // 显示查询高程
+                fetchQueryAlt(e.latlng).then(qalt => {
+                    if (qalt !== undefined) {
+                        startMarker.bindPopup(`起点<br/>lon=${e.latlng.lng.toFixed(6)}<br/>lat=${e.latlng.lat.toFixed(6)}<br/>query_alt=${Number(qalt).toFixed(2)}`).openPopup();
+                        elOriAlt.textContent = Number(qalt).toFixed(2);
+                    }
+                });
+                clicks = 1;
+                startMarker.on('dragend', async () => {
+                    const ll = startMarker.getLatLng();
+                    elOri.textContent = fmtCoord(ll);
+                    const qalt = await fetchQueryAlt(ll);
+                    if (qalt !== undefined) {
+                        startMarker.bindPopup(`起点<br/>lon=${ll.lng.toFixed(6)}<br/>lat=${ll.lat.toFixed(6)}<br/>query_alt=${Number(qalt).toFixed(2)}`).openPopup();
+                        elOriAlt.textContent = Number(qalt).toFixed(2);
+                    }
+                });
+            } else if (clicks === 1) {
+                endMarker = L.marker(e.latlng, { draggable: true }).addTo(map).bindTooltip('终点').openTooltip();
+                elTer.textContent = fmtCoord(e.latlng);
+                fetchQueryAlt(e.latlng).then(qalt => {
+                    if (qalt !== undefined) {
+                        endMarker.bindPopup(`终点<br/>lon=${e.latlng.lng.toFixed(6)}<br/>lat=${e.latlng.lat.toFixed(6)}<br/>query_alt=${Number(qalt).toFixed(2)}`).openPopup();
+                        elTerAlt.textContent = Number(qalt).toFixed(2);
+                    }
+                });
+                clicks = 2;
+                endMarker.on('dragend', async () => {
+                    const ll = endMarker.getLatLng();
+                    elTer.textContent = fmtCoord(ll);
+                    const qalt = await fetchQueryAlt(ll);
+                    if (qalt !== undefined) {
+                        endMarker.bindPopup(`终点<br/>lon=${ll.lng.toFixed(6)}<br/>lat=${ll.lat.toFixed(6)}<br/>query_alt=${Number(qalt).toFixed(2)}`).openPopup();
+                        elTerAlt.textContent = Number(qalt).toFixed(2);
+                    }
+                });
+            } else {
+                clearMap();
+            }
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', clearMap);
+
+        async function doPlan() {
+            try {
+                if (!startMarker || !endMarker) {
+                    setMessage('请在地图上依次点击选择起点与终点', true);
+                    return;
+                }
+                const s = startMarker.getLatLng();
+                const t = endMarker.getLatLng();
+                const alt = Number(elAlt.value || 0);
+                const base = elApi.value.replace(/\/$/, '');
+
+                const url = `${base}/path-planning?lon1=${s.lng}&lat1=${s.lat}&lon2=${t.lng}&lat2=${t.lat}&alt=${alt}`;
+                setMessage('规划中...');
+                const resp = await fetch(url);
+                let data = null;
+                try { data = await resp.json(); } catch (e) { }
+
+                if (!resp.ok) {
+                    // 提取后端详细错误（detail）并展示
+                    const detail = data && (data.detail || data);
+                    if (detail && typeof detail === 'object') {
+                        // 针对起点为障碍的专门提示：包含经纬度与查询高程
+                        if (detail.error === 'origin_blocked') {
+                            const o = detail.origin || {};
+                            const qAlt = (detail.origin_cell_alt !== undefined && detail.origin_cell_alt !== null)
+                                ? detail.origin_cell_alt
+                                : (o.query_alt !== undefined ? o.query_alt : undefined);
+                            const base = `起点所在网格为障碍，不可通`;
+                            const pos = (o.lon !== undefined && o.lat !== undefined)
+                                ? `，起点经纬度为 ${o.lon}, ${o.lat}`
+                                : '';
+                            const q = (qAlt !== undefined)
+                                ? `，查询高程为 ${Number(qAlt).toFixed(2)}`
+                                : '';
+                            setMessage(base + pos + q, true);
+                            return;
+                        }
+
+                        let msg = detail.message || detail.error || `请求失败 (HTTP ${resp.status})`;
+                        if (detail.invalid && Array.isArray(detail.invalid)) {
+                            const items = detail.invalid.map(x => `${x.field}=${x.value} 期望:${x.expect}`).join(' ; ');
+                            msg += ` | 参数问题: ${items}`;
+                        }
+                        if (detail.distance_km !== undefined && detail.limit_km !== undefined) {
+                            msg += ` | 距离: ${detail.distance_km} km，限制: ${detail.limit_km} km`;
+                        }
+                        if (detail.origin && detail.target) {
+                            const o = detail.origin, g = detail.target;
+                            let oextra = '';
+                            if (o.query_alt !== undefined) {
+                                oextra = ` | 起点查询高程=${o.query_alt}`;
+                            }
+                            let gextra = '';
+                            if (g.query_alt !== undefined) {
+                                gextra = ` | 终点查询高程=${g.query_alt}`;
+                            }
+                            msg += ` | 起点(${o.lon},${o.lat}) → 终点(${g.lon},${g.lat})${oextra}${gextra}`;
+                        }
+                        setMessage(msg, true);
+                    } else {
+                        setMessage(`请求失败 (HTTP ${resp.status})`, true);
+                    }
+                    return;
+                }
+
+                if (!data || data.status !== 'success') {
+                    setMessage((data && data.message) || '规划失败', true);
+                    return;
+                }
+
+                // 直接使用后端返回的 path（已包含原始起点与终点）
+                const points = (data.path || []).map(p => [p.lat, p.lon]); // Leaflet 使用 [lat, lng]
+                const alts = (data.path || []).map(p => p.alt);
+                const minAlt = alts.length ? Math.min(...alts) : null;
+                const maxAlt = alts.length ? Math.max(...alts) : null;
+                if (polyline) { map.removeLayer(polyline); polyline = null; }
+                polyline = L.polyline(points, { color: '#2E7D32', weight: 4 }).addTo(map);
+                map.fitBounds(polyline.getBounds(), { padding: [20, 20] });
+
+                // 更新起终点标注，附带高度信息（包含 query_alt）
+                try {
+                    if (startMarker) {
+                        const first = (data.path && data.path[0]) ? data.path[0] : null;
+                        const o_lon = first ? first.lon : s.lng;
+                        const o_lat = first ? first.lat : s.lat;
+                        const o_alt = first ? first.alt : null;
+                        const o_qalt = first && first.query_alt !== undefined ? first.query_alt : null;
+                        startMarker.bindPopup(
+                            `起点` +
+                            `<br/>lon=${o_lon.toFixed(6)}` +
+                            `<br/>lat=${o_lat.toFixed(6)}` +
+                            `<br/>alt=${o_alt !== null && o_alt !== undefined ? o_alt.toFixed(2) : '-'}` +
+                            `<br/>query_alt=${o_qalt !== null && o_qalt !== undefined ? o_qalt.toFixed(2) : '-'}`
+                        ).openPopup();
+                    }
+                    if (endMarker) {
+                        const last = (data.path && data.path.length) ? data.path[data.path.length - 1] : null;
+                        const g_lon = last ? last.lon : t.lng;
+                        const g_lat = last ? last.lat : t.lat;
+                        const g_alt = last ? last.alt : null;
+                        const g_qalt = last && last.query_alt !== undefined ? last.query_alt : null;
+                        endMarker.bindPopup(
+                            `终点` +
+                            `<br/>lon=${g_lon.toFixed(6)}` +
+                            `<br/>lat=${g_lat.toFixed(6)}` +
+                            `<br/>alt=${g_alt !== null && g_alt !== undefined ? g_alt.toFixed(2) : '-'}` +
+                            `<br/>query_alt=${g_qalt !== null && g_qalt !== undefined ? g_qalt.toFixed(2) : '-'}`
+                        );
+                    }
+                } catch (e) { }
+
+                // 输出轨迹为 [{lon:%.4f, lat:%.4f, alt:%.4f}]
+                try {
+                    const items = (data.path || []).map(p => {
+                        const lon = p.lon.toFixed(4);
+                        const lat = p.lat.toFixed(4);
+                        const alt = p.alt.toFixed(4);
+                        return `{lon:${lon}, lat:${lat}, alt:${alt}}`;
+                    });
+                    const trajStr = `[${items.join(', ')}]`;
+                    document.getElementById('traj').innerText = trajStr;
+                    setMessage(`规划成功，路径点数：${points.length}`);
+                } catch (_) {
+                    setMessage(`规划成功，路径点数：${points.length}`);
+                }
+            } catch (err) {
+                console.error(err);
+                setMessage(`错误：${err.message || err}`, true);
+            }
+        }
+
+        document.getElementById('planBtn').addEventListener('click', doPlan);
+
+        // 默认使用当前站点作为服务地址（同源免跨域）
+        try {
+            document.getElementById('apiBase').value = window.location.origin;
+        } catch (e) { }
+    </script>
+</body>
+
+</html>

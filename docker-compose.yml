@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  pathplanning:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: pathplanning:py38
+    container_name: pathplanning-container
+    ports:
+      - "8025:8025"
+    environment:
+      # 服务监听
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8025
+      # 外部高程查询服务
+      - QUERY_HOST=192.168.3.12
+      - QUERY_PORT=5555
+      - QUERY_REQUEST=free/tinder/v3/box2/query
+      # 前端瓦片
+      - TILE_URL=http://192.168.3.100:8035/map/image/tiles/{z}/{x}/{-y}.jpg
+    restart: unless-stopped
+
