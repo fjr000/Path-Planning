@@ -333,7 +333,8 @@
                         const alt = p.alt.toFixed(4);
                         return `{lon:${lon}, lat:${lat}, alt:${alt}}`;
                     });
-                    const trajStr = `[${items.join(', ')}]`;
+                    // 纵向输出，每个点一行
+                    const trajStr = items.join('\n');
                     document.getElementById('traj').innerText = trajStr;
                     setMessage(`规划成功，路径点数：${points.length}`);
                 } catch (_) {

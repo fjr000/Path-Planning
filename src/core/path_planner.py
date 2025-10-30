@@ -12,7 +12,7 @@ def is_colinear(p1, p2, p3, tol=1e-6):
     return abs(cross) < tol
 
 
-def merge_trajectories_smart(trajectory_segments, tol=0.0001):
+def merge_trajectories_smart(trajectory_segments, tol=0.0001, origin: Optional[LLA] = None, target: Optional[LLA] = None):
     """
     合并多段轨迹：
     1. 去掉重复点与过近点；
@@ -46,6 +46,34 @@ def merge_trajectories_smart(trajectory_segments, tol=0.0001):
             continue
         result.append(filtered[i])
     result.append(filtered[-1])
+
+    # 4️⃣ 首尾方向一致性修正：避免相邻两点与端点方向发生>90°的反向折返
+    def angle_cos(ax, ay, bx, by):
+        da = (ax**2 + ay**2) ** 0.5
+        db = (bx**2 + by**2) ** 0.5
+        if da == 0 or db == 0:
+            return 1.0
+        return (ax * bx + ay * by) / (da * db)
+
+    # 首端修正：比较 (origin->first) 与 (first->second)
+    if origin is not None and len(result) >= 2:
+        f0, f1 = result[0], result[1]
+        v1x, v1y = f1.lon - f0.lon, f1.lat - f0.lat
+        v0x, v0y = f0.lon - origin.lon, f0.lat - origin.lat
+        # 角度 > 90° 等价于余弦 < 0
+        if angle_cos(v0x, v0y, v1x, v1y) < 0:
+            # 将起点段改为 origin -> second（丢弃第一个点）
+            result = [f1] + result[2:]
+
+    # 末端修正：比较 (second_last->last) 与 (last->target)
+    if target is not None and len(result) >= 2:
+        p_last = result[-1]
+        p_prev = result[-2]
+        v1x, v1y = p_last.lon - p_prev.lon, p_last.lat - p_prev.lat
+        v2x, v2y = target.lon - p_last.lon, target.lat - p_last.lat
+        if angle_cos(v1x, v1y, v2x, v2y) < 0:
+            # 将最后一段改为 second_last -> target（丢弃最后一个点）
+            result = result[:-1]
 
     return result
 
@@ -189,7 +217,7 @@ class PathPlan:
 
             if self._AStar.get_index(cur_ori, if_clamp=False) == self._AStar.get_index(ter, if_clamp=False):
                 break
-        merge_path = merge_trajectories_smart(paths)
+        merge_path = merge_trajectories_smart(paths, origin=ori, target=ter)
 
         for x in merge_path:
             x.alt = min(0.0,max(x.alt, thred))
