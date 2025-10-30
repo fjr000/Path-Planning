@@ -12,7 +12,14 @@ def is_colinear(p1, p2, p3, tol=1e-6):
     return abs(cross) < tol
 
 
-def merge_trajectories_smart(trajectory_segments, tol=0.0001, origin: Optional[LLA] = None, target: Optional[LLA] = None):
+def merge_trajectories_smart(
+    trajectory_segments,
+    tol=0.0001,
+    origin: Optional[LLA] = None,
+    target: Optional[LLA] = None,
+    gap_lon: Optional[float] = None,
+    gap_lat: Optional[float] = None
+):
     """
     合并多段轨迹：
     1. 去掉重复点与过近点；
@@ -47,7 +54,104 @@ def merge_trajectories_smart(trajectory_segments, tol=0.0001, origin: Optional[L
         result.append(filtered[i])
     result.append(filtered[-1])
 
-    # 4️⃣ 首尾方向一致性修正：避免相邻两点与端点方向发生>90°的反向折返
+    # 4️⃣ 反向回退消除：若出现 A->B->C->B->A（或局部 C->B）等回退段，消去重复路段
+    def lla_close(p: LLA, q: LLA, eps: float) -> bool:
+        return distance(p.lon, p.lat, q.lon, q.lat) < eps
+
+    stack: List[LLA] = []
+    for pt in result:
+        if stack and lla_close(stack[-1], pt, tol):
+            # 相邻重复点，跳过
+            continue
+        if len(stack) >= 2 and lla_close(stack[-2], pt, tol):
+            # 发现回退（... X, Y, X），消去 Y，并不压入 pt（等价回到 X）
+            stack.pop()
+            continue
+        stack.append(pt)
+    result = stack
+
+    # 5️⃣ 相邻反向重叠消除：仅针对相邻两段（避免影响正常同向轨迹）
+    #    若出现 ... A->B->C 且新段 B->C 与上段 A->B 近似共线且方向明显相反，则弹出 B（合并反向段）
+    def colinear(a: LLA, b: LLA, c: LLA, ang_eps: float = 1e-3) -> bool:
+        v1x, v1y = b.lon - a.lon, b.lat - a.lat
+        v2x, v2y = c.lon - a.lon, c.lat - a.lat
+        # 归一化夹角余弦接近 ±1 视为共线
+        da = (v1x*v1x + v1y*v1y) ** 0.5
+        db = (v2x*v2x + v2y*v2y) ** 0.5
+        if da == 0 or db == 0:
+            return True
+        cosv = (v1x*v2x + v1y*v2y) / (da*db)
+        return abs(1.0 - abs(cosv)) < ang_eps
+
+    simp: List[LLA] = []
+    for p in result:
+        if not simp:
+            simp.append(p)
+            continue
+        # 相邻反向重叠，仅移除“回退”点，不改动正常同向行进
+        if len(simp) >= 2:
+            a2 = simp[-1]
+            a1 = simp[-2]
+            # 共线且方向明显相反且与上段有足够重叠（通过中点距离近似判断）
+            v1x, v1y = a2.lon - a1.lon, a2.lat - a1.lat
+            v2x, v2y = p.lon - a2.lon, p.lat - a2.lat
+            da = (v1x*v1x + v1y*v1y) ** 0.5
+            db = (v2x*v2x + v2y*v2y) ** 0.5
+            cosv = 1.0 if da == 0 or db == 0 else (v1x*v2x + v1y*v2y) / (da*db)
+            if colinear(a1, a2, p) and cosv < -0.99:
+                # 检查重叠长度（近似：a1-a2 与 a2-p 的较短长度是否>阈值）
+                min_km = 0.03
+                if min(da, db) > min_km:
+                    simp.pop()  # 移除回退点 a2
+                    # 可能仍有回退，继续用新的末尾再判一次
+                    if len(simp) >= 1:
+                        a2 = simp[-1]
+        # 追加当前点
+        if not simp or distance(simp[-1].lon, simp[-1].lat, p.lon, p.lat) >= tol:
+            simp.append(p)
+    result = simp
+
+    # 6️⃣ 近点回环合并：若出现 ... A -> X -> ... -> A'（A' 接近 A）则收缩为 ... A（或 A -> A'）
+    def loop_prune(points: List[LLA]) -> List[LLA]:
+        if not points:
+            return points
+        kept: List[LLA] = []
+        for p in points:
+            # 基于格网间距估计“近点”阈值（单位：km）
+            if gap_lon is not None and gap_lat is not None:
+                # 使用当前纬度估算经、纬方向的 1 格物理长度
+                km_lon = distance(p.lon, p.lat, p.lon + gap_lon, p.lat)
+                km_lat = distance(p.lon, p.lat, p.lon, p.lat + gap_lat)
+                near_km = max(km_lon, km_lat) * 1.2  # 略放宽
+            else:
+                near_km = 0.03  # ~30m 作为保守近点阈值
+
+            def is_adjacent_grid(a: LLA, b: LLA) -> bool:
+                if gap_lon and gap_lat and gap_lon > 0 and gap_lat > 0:
+                    dx = round((b.lon - a.lon) / gap_lon)
+                    dy = round((b.lat - a.lat) / gap_lat)
+                    return max(abs(dx), abs(dy)) <= 1
+                # 回退：没有格距时用物理近邻
+                return distance(a.lon, a.lat, b.lon, b.lat) < near_km
+
+            # 查找是否接近某个历史点 A
+            merged = False
+            for j in range(len(kept)):
+                # 仅当存在中间段（j 严格小于当前末尾）时才认为是“回环”
+                if j < len(kept) - 1 and is_adjacent_grid(kept[j], p):
+                    # 收缩为 ... A（丢弃中间回环段），A 即 kept[j]
+                    kept = kept[:j+1]
+                    merged = True
+                    break
+            if not merged:
+                # 正常追加
+                if not kept or distance(kept[-1].lon, kept[-1].lat, p.lon, p.lat) >= tol:
+                    kept.append(p)
+        return kept
+
+    result = loop_prune(result)
+
+    # 7️⃣ 首尾方向一致性修正：避免相邻两点与端点方向发生>90°的反向折返
     def angle_cos(ax, ay, bx, by):
         da = (ax**2 + ay**2) ** 0.5
         db = (bx**2 + by**2) ** 0.5
@@ -217,7 +321,13 @@ class PathPlan:
 
             if self._AStar.get_index(cur_ori, if_clamp=False) == self._AStar.get_index(ter, if_clamp=False):
                 break
-        merge_path = merge_trajectories_smart(paths, origin=ori, target=ter)
+        merge_path = merge_trajectories_smart(
+            paths,
+            origin=ori,
+            target=ter,
+            gap_lon=getattr(self._AStar, 'gap_lon', None),
+            gap_lat=getattr(self._AStar, 'gap_lat', None)
+        )
 
         for x in merge_path:
             x.alt = min(0.0,max(x.alt, thred))
