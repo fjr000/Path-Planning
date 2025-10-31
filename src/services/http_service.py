@@ -1,12 +1,13 @@
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from src.core.grid import LLA, distance, lon_is_valid, lat_is_valid
 from src.core.path_planner import PathPlan
-from src.services.query import QueryHelper
+from src.services.query import AsyncQueryHelper
 import uvicorn
 import json
 import logging
 import os
+import asyncio
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -36,6 +37,27 @@ QUERY_HOST = os.getenv("QUERY_HOST", config.get("query_host", "192.168.3.12"))
 QUERY_PORT = int(os.getenv("QUERY_PORT", config.get("query_port", 5555)))
 QUERY_REQUEST = os.getenv("QUERY_REQUEST", config.get("query_request", "free/tinder/v3/box2/query"))
 TILE_URL = os.getenv("TILE_URL", config.get("tile_url", "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"))
+
+# 全局共享的查询助手实例（带缓存）
+_global_query_helper: Optional[AsyncQueryHelper] = None
+
+def get_query_helper() -> AsyncQueryHelper:
+    """获取全局共享的查询助手实例（延迟初始化，支持跨请求缓存）"""
+    global _global_query_helper
+    if _global_query_helper is None:
+        # 缓存精度：0.005度 ≈ 500米，相近的点会使用同一个缓存条目
+        # 可根据需要调整为 0.005-0.01（500米-1公里）
+        cache_precision = 0.005  # 约500米精度
+        _global_query_helper = AsyncQueryHelper(
+            QUERY_HOST, 
+            QUERY_PORT, 
+            QUERY_REQUEST,
+            cache_size=1000,      # 缓存1000条查询结果
+            cache_ttl=300,        # TTL 5分钟
+            cache_precision=cache_precision  # 缓存精度：0.005度
+        )
+        logging.info(f"[Cache] 初始化全局查询助手，缓存配置: size=1000, ttl=300s, precision={cache_precision}度(≈{cache_precision*111:.0f}米)")
+    return _global_query_helper
 
 
 app = FastAPI(
@@ -72,8 +94,8 @@ async def query_alt(
 ):
     """返回以传入点为中心查询得到的代表性高程（最近点）。"""
     try:
-        QH = QueryHelper(QUERY_HOST, QUERY_PORT, QUERY_REQUEST)
-        llas = QH.query(lon, lat)
+        QH = get_query_helper()  # 使用全局共享实例（带缓存）
+        llas = await QH.query(lon, lat)
         if not llas:
             return {"status": "failed", "message": "该点附近无高程数据", "lon": lon, "lat": lat}
 
@@ -130,15 +152,15 @@ async def get_path(
         }
 
     try:
-        QH = QueryHelper(QUERY_HOST, QUERY_PORT, QUERY_REQUEST)
+        QH = get_query_helper()  # 使用全局共享实例（带缓存）
         planning = PathPlan(QH.query_fn)
         ori = LLA(lon1, lat1, alt)
         ter = LLA(lon2, lat2, alt)
         # 将前端 alt 同步为 A* 的障碍阈值 thred，用于后续所有可行性判断
         planning._AStar.thred = alt
 
-        # 预检查：起点与终点附近的高程查询
-        local_data = QH.query_fn(ori)
+        # 先查询起点并构建网格
+        local_data = await QH.query_fn(ori)
         if not local_data:
             return {
                 "status": "failed",
@@ -146,9 +168,33 @@ async def get_path(
                 "message": "起点附近缺少高程/可通行数据",
                 "origin": {"lon": lon1, "lat": lat1}
             }
+        
+        # 构建起点网格
+        planning._AStar.init(local_data)
+        
+        # 尝试从网格获取终点高程（如果终点在起点网格内）
+        ter_data = None
+        if planning._AStar.is_in_grid(ter):
+            # 终点在网格内，直接从网格获取高程
+            try:
+                ter_idx = planning._AStar.get_index(ter)
+                ter_alt = planning._AStar.altitude[ter_idx[0]][ter_idx[1]]
+                # 构造返回格式（模拟查询结果，包含该点）
+                ter_data = [LLA(ter.lon, ter.lat, ter_alt)]
+                logging.debug(f"[GridCache] 终点从网格获取高程: {ter_alt:.2f}")
+            except Exception as e:
+                logging.warning(f"[GridCache] 从网格获取终点高程失败: {e}，回退到查询接口")
+                ter_data = None
+        
+        # 如果终点不在网格内或获取失败，调用查询接口
+        if ter_data is None:
+            try:
+                ter_data = await QH.query(ter.lon, ter.lat)
+            except Exception as e:
+                logging.error(f"终点查询异常: {e}")
+                ter_data = None
 
         # 尝试终点附近是否可取到数据（作为提示）
-        ter_data = QH.query(ter.lon, ter.lat)
         end_hint = {}
         if not ter_data:
             end_hint["no_elevation_data_target"] = True
@@ -169,7 +215,7 @@ async def get_path(
         origin_query_pt = nearest_point(local_data, lon1, lat1)
         target_query_pt = nearest_point(ter_data or [], lon2, lat2)
 
-        planning._AStar.init(local_data)
+        # 网格已在之前初始化，直接使用
         start_idx = planning._AStar.get_index(ori)
         if not planning._AStar.moveable(start_idx):
             # 起点格的高程信息
@@ -194,7 +240,8 @@ async def get_path(
         else:
             end_hint["end_out_of_local_grid"] = True
 
-        path, ok = await run_in_threadpool(planning.PathPlanPair, ori, ter, alt)
+        # 直接调用异步方法，不需要 run_in_threadpool（因为已经是异步的）
+        path, ok = await planning.PathPlanPair(ori, ter, alt)
     except Exception as e:
         logging.error(f"路径规划异常: {e}")
         return {

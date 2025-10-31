@@ -1,7 +1,8 @@
 import time
-from typing import Optional, List
+from typing import Optional, List, Callable, Awaitable, Union
 from .astar import AStar
 from .grid import LLA, distance
+import asyncio
 
 
 def is_colinear(p1, p2, p3, tol=1e-6):
@@ -54,7 +55,7 @@ def merge_trajectories_smart(
         result.append(filtered[i])
     result.append(filtered[-1])
 
-    # 4️⃣ 反向回退消除：若出现 A->B->C->B->A（或局部 C->B）等回退段，消去重复路段
+    # 反向回退消除：若出现 A->B->C->B->A（或局部 C->B）等回退段，消去重复路段
     def lla_close(p: LLA, q: LLA, eps: float) -> bool:
         return distance(p.lon, p.lat, q.lon, q.lat) < eps
 
@@ -70,7 +71,7 @@ def merge_trajectories_smart(
         stack.append(pt)
     result = stack
 
-    # 5️⃣ 相邻反向重叠消除：仅针对相邻两段（避免影响正常同向轨迹）
+    # 相邻反向重叠消除：仅针对相邻两段（避免影响正常同向轨迹）
     #    若出现 ... A->B->C 且新段 B->C 与上段 A->B 近似共线且方向明显相反，则弹出 B（合并反向段）
     def colinear(a: LLA, b: LLA, c: LLA, ang_eps: float = 1e-3) -> bool:
         v1x, v1y = b.lon - a.lon, b.lat - a.lat
@@ -111,7 +112,7 @@ def merge_trajectories_smart(
             simp.append(p)
     result = simp
 
-    # 6️⃣ 近点回环合并：若出现 ... A -> X -> ... -> A'（A' 接近 A）则收缩为 ... A（或 A -> A'）
+    # 近点回环合并：若出现 ... A -> X -> ... -> A'（A' 接近 A）则收缩为 ... A（或 A -> A'）
     def loop_prune(points: List[LLA]) -> List[LLA]:
         if not points:
             return points
@@ -151,7 +152,7 @@ def merge_trajectories_smart(
 
     result = loop_prune(result)
 
-    # 7️⃣ 首尾方向一致性修正：避免相邻两点与端点方向发生>90°的反向折返
+    # 首尾方向一致性修正：避免相邻两点与端点方向发生>90°的反向折返
     def angle_cos(ax, ay, bx, by):
         da = (ax**2 + ay**2) ** 0.5
         db = (bx**2 + by**2) ** 0.5
@@ -220,13 +221,22 @@ def merge_trajectory(traj_list, dist_thresh=0.00001):
 
 
 class PathPlan:
-    def __init__(self, query_func):
+    def __init__(self, query_func: Union[Callable[[LLA], Optional[List[LLA]]], Callable[[LLA], Awaitable[Optional[List[LLA]]]]]):
+        """
+        支持同步或异步查询函数。
+        query_func: 可以是同步函数 (LLA) -> List[LLA] 或异步函数 (LLA) -> Awaitable[List[LLA]]
+        """
         self._query_func = query_func
+        self._is_async = asyncio.iscoroutinefunction(query_func)
         self._AStar = AStar()
         self.visited_ori=set()
 
-    def _update_grid(self, lla:LLA):
-        query_data = self._query_func(lla)
+    async def _update_grid(self, lla:LLA):
+        """更新网格数据，支持异步查询"""
+        if self._is_async:
+            query_data = await self._query_func(lla)
+        else:
+            query_data = self._query_func(lla)
         res = self._AStar.init(query_data)
         return res
 
@@ -264,9 +274,9 @@ class PathPlan:
                 return [], ok
         return merge_trajectory(paths), ok
 
-    def PathPlanPair(self, ori: LLA, ter: LLA, thred: float):
+    async def PathPlanPair(self, ori: LLA, ter: LLA, thred: float):
         """
-        分块贪心路径规划。
+        分块贪心路径规划（异步版本）。
         thred: 海拔高于 thred 认定为障碍
         """
         self._AStar.thred = thred
@@ -274,9 +284,9 @@ class PathPlan:
         paths = []
         self.visited_ori.add((cur_ori.lon, cur_ori.lat))
 
-        def local_search(start: LLA, end: LLA):
+        async def local_search(start: LLA, end: LLA):
             st = time.time()
-            res = self._update_grid(start)
+            res = await self._update_grid(start)
             if not res:
                 print(f"高程信息缺失，查询点：{start}")
                 return [], False, start
@@ -295,7 +305,7 @@ class PathPlan:
             ed2 = time.time()
             return [], False, start
 
-        first_path, ok, cur_ori = local_search(cur_ori, ter)
+        first_path, ok, cur_ori = await local_search(cur_ori, ter)
         if not ok:
             print("初始局部区域内无法规划路径。")
             return [], False
@@ -311,7 +321,7 @@ class PathPlan:
             if self._AStar.get_index(cur_ori, if_clamp=False) == self._AStar.get_index(ter, if_clamp=False):
                 break
 
-            path, ok, new_ori = local_search(cur_ori, ter)
+            path, ok, new_ori = await local_search(cur_ori, ter)
             if not ok:
                 print("当前网格内无法继续前进，停止规划。")
                 break
