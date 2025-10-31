@@ -255,10 +255,17 @@ async def get_path(
 
         def lla_to_dict(lla: LLA):
             return {"lon": lla.lon, "lat": lla.lat, "alt": lla.alt}
+        
+        # origin 和 target 字段（包含 query_alt，用于响应信息）
         origin_dict = {"lon": lon1, "lat": lat1, "alt": alt, "query_alt": origin_query_alt}
         target_dict = {"lon": lon2, "lat": lat2, "alt": alt, "query_alt": target_query_alt}
+        
+        # path 字段中的点（只包含 lon、lat、alt，不包含 query_alt）
         core_path = [lla_to_dict(p) for p in path]
-        full_path = [origin_dict] + core_path + [target_dict]
+        origin_path_point = {"lon": lon1, "lat": lat1, "alt": alt}
+        target_path_point = {"lon": lon2, "lat": lat2, "alt": alt}
+        full_path = [origin_path_point] + core_path + [target_path_point]
+        
         return {
             "status": "success",
             "origin": origin_dict,
